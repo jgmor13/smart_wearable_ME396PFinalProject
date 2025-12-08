@@ -1,96 +1,93 @@
-# -*- coding: utf-8 -*-
+# main.py
 """
-Created on Wed Nov 26 18:33:26 2025
-
-@author: rocio
+BioWatch v1 — Real-time PPG Emulator (Reads from PPG file)
+Live Watch-style GUI + UDP JSON broadcast.
+Works in parallel with a databasebase processor to publish metrics.
 """
 
-# Imports
-from HR_Processing import HRProcessor
-from HRV_Processing import HRVProcessor
-import dash
-from dash import html
-
-# from activity_classifier import ActivityClassifier
-from User_Profile import UserProfile
-from Training_Zone import zones_karvonen
-from Training_Zone import zone_label
-from VO2_Max_Estimator import vo2max_uth
-
-# import time
-# import math
-from collections import deque
-import random
+import json
+import queue
+import socket
+import threading
 import time
+from datetime import datetime
+
+#from local
+from constants import DEVICE_NAME, PLAYBACK_SPEED, WINDOW_SECONDS
+from gui import WatchGUI
+from sensor_simulator import SensorSimulator
+from signal_processor import compute_metrics
+
+class BioWatchEmulator:
+
+    def __init__(self):
+        # UDP broadcast
+        self.udp_host = "127.0.0.1"     #Local Host
+        self.udp_port = 4444
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.queue = queue.Queue(maxsize=2)
+
+        print(f"\n{DEVICE_NAME} Emulator")
+        print(f"   • Speed: {PLAYBACK_SPEED:.1f}x")
+        print(f"   • Sending Live Metrics to : {self.udp_host}:{self.udp_port} :Localhost")
+        print("   Close window to stop.\n")
+
+    def start_processing(self):
+        """Background thread: read sensor → compute metrics forever."""
+        sensor = SensorSimulator()
+
+        while True:
+            chunk = sensor.get_next_chunk()
+            metrics = compute_metrics(chunk)
+
+            # Keep only the newest data
+            try:
+                self.queue.put_nowait(metrics)
+            except queue.Full:
+                try:
+                    self.queue.get_nowait()  # drop old
+                except:
+                    pass
+                self.queue.put_nowait(metrics)
+
+            #mess with playback speed to go faster than 8 sec per datum
+            time.sleep(WINDOW_SECONDS / PLAYBACK_SPEED)
+
+    def gui_update_loop(self, gui: WatchGUI):
+        """Pull latest metrics and update GUI + broadcast over UDP."""
+        try:
+            metrics = self.metrics_queue.get_nowait()
+        except queue.Empty:
+            metrics = None
+
+        if metrics:
+            gui.update(metrics)
+
+            # This is the live JSON being sent over the network
+            payload = {
+                "device": DEVICE_NAME,
+                "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+                "unix_timestamp": int(time.time()),
+                **metrics #unpacks metrics
+            }
+            self.sock.sendto(
+                json.dumps(payload).encode("utf-8"),
+                (self.broadcast_ip, self.port)
+            )
+
+        # Refresh GUI at ~100 Hz
+        gui.root.after(100, lambda: self.gui_updater(gui))
+
+    def run(self):
+        """Launch GUI and start everything."""
+        gui = WatchGUI()
+        # Start processing incoming PPG data
+        threading.Thread(target=self.start_processing, daemon=True).start()
+        # Start GUI updates after window appears
+        gui.root.after(300, lambda: self.gui_update_loop(gui))
+        gui.run()
 
 
-# Initialize modules
-user = UserProfile(23, 5, 4, "F", 200)
-hr_resting  = 62
-hr_max = 192
 
-# age = input("Age? ")
-# feet = input("Feet: ")
-# inches = input("Inches: ")
-# sex = input("Sex? M or F: ")
-# weight = input("Weight? ")
-
-# user = UserProfile(age, feet, inches, sex, weight)
-
-# hr_resting = user.resting_hr
-# hr_max = user.hr_max
-
-hr_processor = HRProcessor()
-hrv_processor = HRVProcessor()
-# classifier = ActivityClassifier()
-
-
-
-
-# Allocate Buffers
-# imu_buffer = deque(maxlen=window_size)
-hr_buffer = deque(maxlen=300)   # 5 minutes at 1 Hz
-rr_buffer = deque(maxlen=300)
-
-
-from Heart_Rate_Sim import Simulated_HR
-sim_hr = Simulated_HR(start_hr=75)
-
-
-# Main Loop
-step = 0
-
-while True:
-    # 1. Read heart rate
-    # hr_raw = sim_hr.resting()    
-    hr_raw = sim_hr.workout(step)
-
-    # 2. Process HR
-    clean_hr = hr_processor.process(hr_raw)
-    if clean_hr is None:
-        continue
-
-    # 3. Determine training zone
-    zone = zones_karvonen(clean_hr, hr_max, hr_resting)
-    label = zone_label(zone)
-
-
-    # 4. Compute additional metrics (optional)
-    # e.g., add RR intervals for HRV
-    rr = hrv_processor.add_beat(timestamp=time.time())
-    rmssd_val = hrv_processor.get_rmssd() # in ms
-    
-    rmssd_display = f"{rmssd_val:.2f}" if rmssd_val is not None else "N/A"
-
-
-    # VO2 max example
-    vo2_max = vo2max_uth(hr_max, hr_resting)
-    
-    # 5. Update output
-    print(f"❤️ {clean_hr} BPM | Zone: {label} | RMSSD: {rmssd_display} ms | VO2max: {vo2_max:.2f} mL/kg/min")
-
-    # 6. Wait for the next reading
-    step += 1
-    time.sleep(1)  # simulate 1 Hz update rate
-
-
+if __name__ == "__main__":
+    BioWatchEmulator().run()
